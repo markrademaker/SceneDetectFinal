@@ -5,8 +5,9 @@ from torch.utils.data import DataLoader
 from argparse import ArgumentParser
 from torch.utils.data import Dataset, DataLoader, random_split
 # Assuming BiGRUModel and EmbeddingDataset are defined as in previous examples
-from Embedder import AudioEmbedder, LoadDF, load_dataset
+from Embedder import AudioEmbedder, embedder_main
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC, Wav2Vec2Model
+from Dataloader import LoadDF
 import tqdm
 import copy
 import matplotlib.pyplot as plt
@@ -80,7 +81,7 @@ class AudioModelTrainer:
         return avg_val_loss
     
     def save_training(self):
-        name = f"training_lr{self.optimizer.learning_rate}_wd{self.optimizer.weight_decay}_layers{self.model.num_layers}_epochs{self.model.hidden_size}.txt"
+        name = f"training_lr{self.optimizer.lr}_wd{self.optimizer.weight_decay}_layers{self.model.num_layers}_epochs{self.model.hidden_size}.txt"
         
         # Open the file for writing
         with open(name, "w") as f:
@@ -92,6 +93,7 @@ class AudioModelTrainer:
                 f.write(f"{epoch},{train_loss:.4f},{val_loss:.4f}\n")
         
         print(f"Training results saved to {name}")
+
     def report(self):
         """Plot the training and validation loss."""
         plt.figure(figsize=(10, 6))
@@ -103,17 +105,66 @@ class AudioModelTrainer:
         plt.legend()
         plt.show()
 
+
 class AudioBiGRU(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes):
+    def __init__(self, embed_size, hidden_size, num_layers, num_classes, with_pooling):
         super(AudioBiGRU, self).__init__()
-        self.bigru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
+        #input_size = tracks * (embed_dim_0 / pool_stride_0) * (embed_dim_1 / pool_stride_1)
+        embed_dim_0, embed_dim_1 = embed_size
+        pool_kernel = (2, 2)  # Pool size
+        pool_stride = (2, 2)  # Assuming stride is the same as pool size
+
+        # Calculate output dimensions after pooling
+        output_dim_0 = (embed_dim_0 - pool_kernel[0]) // pool_stride[0] + 1
+        output_dim_1 = (embed_dim_1 - pool_kernel[1]) // pool_stride[1] + 1
+
+        # Calculate the flattened size assuming 2 tracks (channels)
+        tracks = 2
+        flattened_size = tracks * output_dim_0 * output_dim_1
+        self.bigru = nn.GRU(flattened_size, hidden_size, num_layers, batch_first=True, bidirectional=True)
         self.fc = nn.Linear(hidden_size * 2, num_classes)  # *2 for bidirectional
+        # Initialize the pooling layer here to apply across embed_dim_0 and embed_dim_1
+
+        self.with_pooling = with_pooling
+        # Average pooling will find a more generale transition in sound instead of finding a single sign
+        self.pool = nn.AvgPool2d(kernel_size=pool_kernel, stride=pool_stride)  # Example values, adjust as needed
 
     def forward(self, x):
-        out, _ = self.bigru(x)  # out: batch, seq, hidden*2
-        out = out[:, -1, :]  # Take the output of the last time step
-        out = self.fc(out)
+
+        batch_size, seq_length, tracks, embed_dim_0, embed_dim_1 = x.size()
+        if(self.with_pooling):
+            # Reshape to combine batch and seq_length dimensions to apply pooling independently per timestep and track
+            x_reshaped = x.view(batch_size * seq_length * tracks, embed_dim_0, embed_dim_1)
+            
+            # Apply pooling - since the input to AvgPool2d should be (N, C, H, W), where N is the batch size,
+            # C is the number of channels (in this case, 1, since we're pooling over the embedding dimensions),
+            # H is embed_dim_0, and W is embed_dim_1, we need to add a dummy channel dimension
+            x_reshaped = x_reshaped.unsqueeze(1)  # Add a channel dimension
+            pooled_x = self.pool(x_reshaped)
+            
+            # Remove the dummy channel dimension and reshape back to original batch, seq_length, and tracks structure
+            pooled_x = pooled_x.squeeze(1)  # Remove channel dimension
+            pooled_x = pooled_x.view(batch_size, seq_length, tracks, -1)  # Reshape back
+            
+            # Flatten the last three dimensions to create a feature vector for each sequence element
+            new_x = pooled_x.view(batch_size, seq_length, -1)
+        else:
+            batch_size, seq_length, tracks, embed_dim_0, embed_dim_1 = x.size()
+            feature_size = tracks * embed_dim_0 * embed_dim_1
+
+            # This is flattening the embedding with 2 tracks
+            new_x = x.view(batch_size, seq_length, feature_size)
+        out, _ = self.bigru(new_x)  # out: batch_size, seq_length, hidden_size*2 due to bidirectionality
+
+        # Applying the fully connected layer to each timestep
+        out = out.reshape(-1, out.shape[2]) # Flatten for FC layer
+        out = self.fc(out)  # Now, out is of shape (batch_size*seq_length, num_classes)
+        
+        # Reshape out back to (batch_size, seq_length, num_classes) for sequence labeling tasks
+        out = out.view(batch_size, seq_length, -1)
+        
         return out
+
     
 class FineTuneAudioBiGRU(nn.Module):
     def __init__(self, hidden_size, num_layers, num_classes, embedder_model_name="facebook/wav2vec2-base-960h"):
@@ -216,6 +267,7 @@ def process_audio_and_create_labels(audio_paths,dt=2, intro_outro_duration=5):
 
     return processed_data
 
+
 def yamnet(audio_paths):
     yamnet = YAMnetClassifier()
     yamnet_embeddings=[]
@@ -236,23 +288,31 @@ def parse_args(config, combination):
 
 if __name__ == "__main__":
     # Load configuration file
-    with open('/Users/markrademaker/Downloads/Work/Scriptie/Code/SceneNet/config.json', 'r') as file:
+    data_folder="/Volumes/SeaGate/MoviesCMD"
+    with open('SceneNet/config.json', 'r') as file:
         config = json.load(file)
     modality='audio'
     embed_type='pretrained'
-
+    load_type="loading" #[creating, creating_and_writing, loading]
+    chunk_duration=3
+    test_threshold=30
+    resample_rate=16000
     # Generate all combinations of hyperparameters
     keys, values = zip(*config.items())
     print(keys, values)
+
     combinations = [dict(zip(keys, v)) for v in product(*values)]
-    df = LoadDF()  # Load your dataframe here
+
+    df = LoadDF(data_folder)  # Load your dataframe here
     embedder = AudioEmbedder()
     for combination in combinations:
         args = parse_args(config, combination)
         print("Start embedding audio streams... ")
+
         if(embed_type=="pretrained"):
-            dataset, tensor_size = load_dataset(df,modality, embedder, chunk_duration=3, resample_rate=16000)
-        elif(embed_type=="raw"):
+            dataset, embed_size = embedder_main(data_folder,df ,modality, embedder, chunk_duration, load_type,resample_rate, test_threshold)
+
+        elif(embed_type=="train_embeds"):
             processed_data = process_audio_and_create_labels(df['audio_path'])
 
             # Initialize your dataset with the processed data
@@ -260,19 +320,19 @@ if __name__ == "__main__":
 
             # Example: Access the first item in the dataset
             waveform_acc, waveform_voc, label = dataset[0]
-            print(waveform_acc,waveform_voc)
+
         total_size = len(dataset)
-        train_size = int(total_size * 0.9)
+        train_size = int(total_size * 0.2)
         val_size = total_size - train_size
         print(f"Training with: {combination}")
+
         train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
-
-        model = AudioBiGRU(input_size=tensor_size, hidden_size=args.hidden_size, num_layers=args.num_layers, num_classes=1)
-
+        model = AudioBiGRU(embed_size=embed_size, hidden_size=args.hidden_size, num_layers=args.num_layers, num_classes=1, with_pooling=True)
+        print(val_dataset)
         # Set up the criterion and optimizer
-        criterion = nn.BCEWithLogitsLoss()
+        criterion = nn.BCEWithLogitsLoss(reduction='mean')
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
         # Initialize and run the trainer
