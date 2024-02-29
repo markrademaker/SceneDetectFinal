@@ -1,6 +1,7 @@
 import torch
 import torchaudio
 from torch import nn, optim
+import torch.nn.init as init
 from torch.utils.data import DataLoader
 from argparse import ArgumentParser
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -38,32 +39,23 @@ class AudioModelTrainer:
             self.model.train()
             train_loss = 0
             total_batches = len(self.train_loader)
-            intra_epoch_interval = max(1, total_batches // 5)  # Determine interval for intra-epoch validation
+            intra_epoch_interval = max(1, total_batches // 2)  # Determine interval for intra-epoch validation
 
-            for batch_idx, (inputs, labels) in enumerate(self.train_loader, start=1):
+            for batch_idx, (inputs, labels) in enumerate(self.train_loader):
                 self.optimizer.zero_grad()
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, labels)
                 loss.backward()
                 self.optimizer.step()
                 train_loss += loss.item()
-
-                # Intra-Epoch Validation Check
-                if batch_idx % intra_epoch_interval == 0 or batch_idx == total_batches:
-                    current_train_loss = train_loss / batch_idx
-                    avg_val_loss = self.validate()  # Assuming self.validate() computes the validation loss
+                avg_val_loss,val_loss = self.validate()
+                print(f'Epoch {epoch+1}/{self.num_epochs}, Step {batch_idx+1}/{total_batches}, Training Loss: {loss.item():.4f}, Validation Loss: {val_loss:.4f}')
                     
-                    # Store the current training and validation loss
-                    all_training_losses.append(current_train_loss)
-                    all_validation_losses.append(avg_val_loss)
-
-                    print(f'Epoch {epoch+1}/{self.num_epochs}, Step {batch_idx}/{total_batches}, Training Loss: {current_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}')
-                    
-                    # Check if this is the best model so far and save it
-                    if avg_val_loss < best_val_loss:
-                        best_val_loss = avg_val_loss
-                        best_model_wts = copy.deepcopy(self.model.state_dict())
-                        torch.save(self.model.state_dict(), 'best_model.pth')  # Save the best model
+                # Check if this is the best model so far and save it
+                if val_loss< best_val_loss:
+                    best_val_loss = val_loss
+                    best_model_wts = copy.deepcopy(self.model.state_dict())
+                    torch.save(self.model.state_dict(), 'best_model.pth')  # Save the best model
             # At the end of training, you can choose to load the best model weights
             self.model.load_state_dict(best_model_wts)
         # Optionally, you can return the best model and the loss lists
@@ -78,10 +70,10 @@ class AudioModelTrainer:
                 loss = self.criterion(outputs, labels)
                 val_loss += loss.item()
         avg_val_loss = val_loss / len(self.val_loader)
-        return avg_val_loss
+        return avg_val_loss, loss.item()
     
-    def save_training(self):
-        name = f"training_lr{self.optimizer.lr}_wd{self.optimizer.weight_decay}_layers{self.model.num_layers}_epochs{self.model.hidden_size}.txt"
+    def save_training(self,args):
+        name = f"training_lr{args.lr}_wd{args.wd}_layers{args.num_layers}_hidden{args.hidden_size}_batch{args.batch_size}_epochs{args.num_epochs}.txt"
         
         # Open the file for writing
         with open(name, "w") as f:
@@ -94,6 +86,22 @@ class AudioModelTrainer:
         
         print(f"Training results saved to {name}")
 
+    def get_majority_class_loss(self,dataloader):
+        all_targets = []
+        for _, target in dataloader:
+            all_targets.append(target)
+        all_targets = torch.cat(all_targets)  # Concatenate list of tensors into a single tensor
+
+        predictions = torch.zeros_like(all_targets) # Always predicting 0 logits
+
+        # Define the criterion
+        criterion = nn.BCEWithLogitsLoss(reduction='mean')
+
+        # Calculate the loss
+        loss = criterion(predictions, all_targets)
+
+        return loss
+    
     def report(self):
         """Plot the training and validation loss."""
         plt.figure(figsize=(10, 6))
@@ -128,7 +136,23 @@ class AudioBiGRU(nn.Module):
         self.with_pooling = with_pooling
         # Average pooling will find a more generale transition in sound instead of finding a single sign
         self.pool = nn.AvgPool2d(kernel_size=pool_kernel, stride=pool_stride)  # Example values, adjust as needed
+        self.initialize_weights()
 
+    def initialize_weights(self):
+        # Set a seed for reproducibility
+        torch.manual_seed(42)
+
+        # Iterate over all modules in your model
+        for m in self.modules():
+            if isinstance(m, nn.GRU):
+                # GRU weights initialization
+                for name, param in m.named_parameters():
+                    if 'weight' in name:
+                        init.constant_(param, 0.01)  # Example: setting to a small constant
+            elif isinstance(m, nn.Linear):
+                init.constant_(m.weight, 0.01)  # Example: setting to a small constant
+                if m.bias is not None:
+                    init.constant_(m.bias, 0.01)
     def forward(self, x):
 
         batch_size, seq_length, tracks, embed_dim_0, embed_dim_1 = x.size()
@@ -165,7 +189,6 @@ class AudioBiGRU(nn.Module):
         
         return out
 
-    
 class FineTuneAudioBiGRU(nn.Module):
     def __init__(self, hidden_size, num_layers, num_classes, embedder_model_name="facebook/wav2vec2-base-960h"):
         super(FineTuneAudioBiGRU, self).__init__()
@@ -293,9 +316,9 @@ if __name__ == "__main__":
         config = json.load(file)
     modality='audio'
     embed_type='pretrained'
-    load_type="loading" #[creating, creating_and_writing, loading]
+    load_type="creating_and_writing" #[creating, creating_and_writing, loading]
     chunk_duration=3
-    test_threshold=30
+    test_threshold=10
     resample_rate=16000
     # Generate all combinations of hyperparameters
     keys, values = zip(*config.items())
@@ -307,6 +330,8 @@ if __name__ == "__main__":
     embedder = AudioEmbedder()
     for combination in combinations:
         args = parse_args(config, combination)
+
+        print(f"arguments for current run {args}")
         print("Start embedding audio streams... ")
 
         if(embed_type=="pretrained"):
@@ -322,21 +347,24 @@ if __name__ == "__main__":
             waveform_acc, waveform_voc, label = dataset[0]
 
         total_size = len(dataset)
-        train_size = int(total_size * 0.2)
+        train_size = 16#int(total_size * 0.2)
         val_size = total_size - train_size
         print(f"Training with: {combination}")
 
         train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False)
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+        print(f"batches {len(train_loader)}")
         model = AudioBiGRU(embed_size=embed_size, hidden_size=args.hidden_size, num_layers=args.num_layers, num_classes=1, with_pooling=True)
-        print(val_dataset)
+        
         # Set up the criterion and optimizer
-        criterion = nn.BCEWithLogitsLoss(reduction='mean')
+        criterion = nn.BCEWithLogitsLoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
         # Initialize and run the trainer
         trainer = AudioModelTrainer(model, train_loader, val_loader, criterion, optimizer, args.num_epochs)
         trainer.train()
-        trainer.save_training()
-        trainer.report()
+        majority_loss=trainer.get_majority_class_loss(val_loader)
+        print(f" Always predicting 0 would get validation loss: {majority_loss}")
+        trainer.save_training(args)
+        #trainer.report()

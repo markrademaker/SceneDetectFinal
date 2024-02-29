@@ -3,7 +3,7 @@
     "wd": [1e-5, 1e-4, 1e-3],
     "num_layers": [1, 2, 3],
     "hidden_size": [1,64, 128, 256],
-    "batch_size": [16, 32, 64],
-    "num_epochs": [10, 15, 20]
+    "batch_size": [8,16, 32, 64],
+    "num_epochs": [5, 15, 20]
   }
   

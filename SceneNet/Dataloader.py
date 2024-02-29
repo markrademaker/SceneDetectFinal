@@ -26,23 +26,23 @@ def load_video_files(folder_path):
     """
     Load video file paths from the specified directory into a pandas DataFrame.
     """
+
     data_from_files = []
-    for folder in os.listdir(folder_path):
-        if folder.startswith('.') or folder.endswith("Store"):
-            continue
-        print(f"Year {folder} movies loading..")
-        subfolder_path = os.path.join(folder_path, folder)
-        for file in os.listdir(subfolder_path):
-            file_path = os.path.join(subfolder_path, file)
-            if os.path.isfile(file_path) and file_path.endswith(".mkv"):
-                data_from_files.append({
-                    'videoid': file[:-4],
-                    'path': file_path,
-                    'audio_path': file_path[:-4] + "_audio.opus",
-                    'acc_path': file_path[:-4] + "_audio/accompaniment.wav",
-                    'voc_path': file_path[:-4] + "_audio/vocals.wav",
-                    'video_path': file_path[:-4] + "_video.xxx",
-                })
+    id_file_path = folder_path + "/scene_id.txt"
+    with open(id_file_path, 'r') as f:
+        video_ids = f.read().splitlines()
+    for video_id in video_ids:
+        file_path = folder_path +"/videos/"+ video_id
+        data_from_files.append({
+            'videoid': file_path,
+            'path': file_path+".mkv",
+            'audio_path': file_path + "_audio.opus",
+            'acc_path': file_path + "_audio/accompaniment.wav",
+            'voc_path': file_path + "_audio/vocals.wav",
+            'video_path': file_path+ "_video.xxx",
+        })
+    print(len(data_from_files))
+    pd.DataFrame(data_from_files)
     return pd.DataFrame(data_from_files)
 
 def LoadDF(data_folder):
@@ -56,7 +56,7 @@ def LoadDF(data_folder):
     merged_df = merge_dataframes(movies_df, movie_info_df, casts_df, split_df)
     
     # Load video files
-    files_df = load_video_files(folder_path)
+    files_df = load_video_files(data_folder)
     
     # Merge video files DataFrame with metadata
     video_df = pd.merge(clips_df, descriptions_df, on=['videoid','imdbid'], how='outer')

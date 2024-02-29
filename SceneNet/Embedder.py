@@ -74,7 +74,7 @@ class AudioEmbedder:
             current_sample += part_length
         return accumulated_waveform_acc, accumulated_waveform_voc,part_boundaries
     
-    def process_audio(self, audio_df, chunk_duration, intro_outro_duration=6, resample_rate=16000):
+    def process_audio(self, audio_df, chunk_duration, resample_rate=16000):
         accumulated_waveform_acc, accumulated_waveform_voc, part_boundaries =self.get_waveforms_all_clips(audio_df,resample_rate)
         # Chunk and process waveforms
         embeddings_list = []
@@ -139,7 +139,7 @@ class AudioEmbedder:
         return embeddings
     
 class VideoEmbedder:
-    def __init__(self, model_name='resnet18', frame_rate=1, resize_shape=(224, 224), intro_outro_duration=5):
+    def __init__(self, model_name='resnet18', frame_rate=1, resize_shape=(224, 224), chunk_duration=3):
         self.model = getattr(models, model_name)(pretrained=True)
         self.frame_rate = frame_rate
         self.transform = Compose([
@@ -147,7 +147,7 @@ class VideoEmbedder:
             ToTensor(),
             Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-        self.intro_outro_duration = intro_outro_duration
+        self.chunk_duration=chunk_duration
 
     def process_video(self, video_paths):
         embeddings_list = []
@@ -182,7 +182,7 @@ class VideoEmbedder:
             embeddings_list.append(pooled_embeddings)
             
             # Calculate the number of embeddings for the first and last 5 seconds
-            num_intro_outro_frames = int(self.intro_outro_duration * self.frame_rate)
+            num_intro_outro_frames = int(self.chunk_duration * self.frame_rate)
             num_embeddings = transformed_frames.size(0)
             labels = torch.zeros(num_embeddings)
             
@@ -267,7 +267,6 @@ def embedder_main(data_folder,df,modality, embedder, chunk_duration=3, load_type
     embeddings_list = []
     labels_list = []
     count=0
-    intro_outro_duration=3
     reverse_group_keys = list(df.groups.keys())[::-1]
 
     for key in reverse_group_keys:
@@ -285,15 +284,15 @@ def embedder_main(data_folder,df,modality, embedder, chunk_duration=3, load_type
             if(load_type=="loading"):
                 mov_embeddings, mov_labels = load_embeddings_from_file(data_folder,key, chunk_duration)
             elif(load_type=="creating"):
-                mov_embeddings, mov_labels = embedder.process_audio(group_df, chunk_duration, intro_outro_duration, resample_rate)
+                mov_embeddings, mov_labels = embedder.process_audio(group_df, chunk_duration, resample_rate)
             elif(load_type=="creating_and_writing"):
                 labels_file_path = f'{data_folder}/embeddings/movie_{key}_chunk:{chunk_duration}_labels.csv'
                 # if the movie embeddings with cunk durations do already exist do not create and write
                 if os.path.exists(labels_file_path):
                     count -=1
                     continue
-                mov_embeddings, mov_labels = embedder.process_audio(data_folder,group_df, chunk_duration, intro_outro_duration, resample_rate)
-                write_embeddings_to_file(mov_embeddings,mov_labels,key,chunk_duration)
+                mov_embeddings, mov_labels = embedder.process_audio(group_df, chunk_duration, resample_rate)
+                write_embeddings_to_file(data_folder,mov_embeddings,mov_labels,key,chunk_duration)
             else:
                 print(f"Specify how you want to retrieve embeddings data with: load_type={load_type} as either loading, creating or creating_and_writing")
         elif(modality=='video'):
